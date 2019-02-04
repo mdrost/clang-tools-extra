@@ -174,6 +174,7 @@ IdentifierNamingCheck::IdentifierNamingCheck(StringRef Name,
         .Case("CamelCase", CT_CamelCase)
         .Case("Camel_Snake_Case", CT_CamelSnakeCase)
         .Case("camel_Snake_Back", CT_CamelSnakeBack)
+        .Case("HungarianNotation", CT_HungarianNotation)
         .Default(llvm::None);
   };
 
@@ -210,6 +211,8 @@ void IdentifierNamingCheck::storeOptions(ClangTidyOptions::OptionMap &Opts) {
       return "Camel_Snake_Case";
     case CT_CamelSnakeBack:
       return "camel_Snake_Back";
+    case CT_HungarianNotation:
+      return "HungarianNotation";
     }
 
     llvm_unreachable("Unknown Case Type");
@@ -248,6 +251,7 @@ void IdentifierNamingCheck::registerPPCallbacks(CompilerInstance &Compiler) {
 }
 
 static bool matchesStyle(StringRef Name,
+                         const NamedDecl *D,
                          IdentifierNamingCheck::NamingStyle Style) {
   static llvm::Regex Matchers[] = {
       llvm::Regex("^.*$"),
@@ -257,6 +261,7 @@ static bool matchesStyle(StringRef Name,
       llvm::Regex("^[A-Z][a-zA-Z0-9]*$"),
       llvm::Regex("^[A-Z]([a-z0-9]*(_[A-Z])?)*"),
       llvm::Regex("^[a-z]([a-z0-9]*(_[A-Z])?)*"),
+      llvm::Regex("^[A-Z][a-zA-Z0-9]*$"),
   };
 
   bool Matches = true;
@@ -275,13 +280,62 @@ static bool matchesStyle(StringRef Name,
   if (Name.startswith("_") || Name.endswith("_"))
     Matches = false;
 
+  if (D && Style.Case && *Style.Case == IdentifierNamingCheck::CT_HungarianNotation) {
+    if (const auto *Decl = dyn_cast<VarDecl>(D)) {
+      QualType Q = Decl->getType().getNonReferenceType();
+      const Type *T = Q.getTypePtr();
+      if (T->isPointerType()) {
+        Q = T->getPointeeType();//.getDesugaredType(Decl->getASTContext());
+        T = Q.getTypePtr();
+        if (T->isCharType() && (Name.startswith("sz") || Name.startswith("pc")))
+          Name = Name.drop_front(2);
+        else if (T->isWideCharType() && (Name.startswith("sz") || Name.startswith("pc")))
+          Name = Name.drop_front(2);
+        else if (Name.startswith("p"))
+          Name = Name.drop_front(1);
+        else
+          Matches = false;
+      } else {
+        if (T->isSignedIntegerType() && T->isCharType() && Name.startswith("c"))
+          Name = Name.drop_front(1);
+        else if (T->isSignedIntegerType() && T->isWideCharType() && Name.startswith("c"))
+          Name = Name.drop_front(1);
+      }
+      if (T->isBooleanType() && Name.startswith("b"))
+        Name = Name.drop_front(1);
+      else if (T->isSignedIntegerType() && Name.startswith("n"))
+        Name = Name.drop_front(1);
+      else if (T->isUnsignedIntegerType() && T->isCharType() && Name.startswith("y"))
+          Name = Name.drop_front(1);
+      else if (T->isUnsignedIntegerType() && Name.startswith("u"))
+        Name = Name.drop_front(1);
+      else if (T->isObjectType()) {
+          StringRef S = Q.getAsString();
+          if (Name.startswith("str") && (S.endswith_lower("string") || S.endswith_lower("stringw")))
+            Name = Name.drop_front(3);
+          else if (Name.startswith("p") && S.endswith_lower("ptr"))
+            Name = Name.drop_front(1);
+          else if (Name.startswith("ay") && S.endswith_lower("array"))
+            Name = Name.drop_front(2);
+      } 
+      else
+        Matches = false;
+    }
+  }
+
   if (Style.Case && !Matchers[static_cast<size_t>(*Style.Case)].match(Name))
     Matches = false;
 
   return Matches;
 }
 
+static bool matchesStyle(StringRef Name,
+                         IdentifierNamingCheck::NamingStyle Style) {
+  return matchesStyle(Name, nullptr, Style);
+}
+
 static std::string fixupWithCase(StringRef Name,
+                                 const NamedDecl *D,
                                  IdentifierNamingCheck::CaseType Case) {
   static llvm::Regex Splitter(
       "([a-z0-9A-Z]*)(_+)|([A-Z]?[a-z0-9]+)([A-Z]|$)|([A-Z]+)([A-Z]|$)");
@@ -372,20 +426,82 @@ static std::string fixupWithCase(StringRef Name,
       Fixup += Word.substr(1).lower();
     }
     break;
+
+  case IdentifierNamingCheck::CT_HungarianNotation:
+    for (auto const &Word : Words) {
+      Fixup += Word.substr(0, 1).upper();
+      Fixup += Word.substr(1).lower();
+    }
+    if (D) {
+      if (const auto *Decl = dyn_cast<VarDecl>(D)) {
+        std::string Prefix;
+        QualType Q = Decl->getType().getNonReferenceType();
+        const Type *T = Q.getTypePtr();
+        if (T->isPointerType()) {
+          Q = T->getPointeeType();// .getDesugaredType(Decl->getASTContext());
+          T = Q.getTypePtr();
+          if (T->isCharType())
+            Prefix += "sz";
+          else if (T->isWideCharType())
+            Prefix += "sz";
+          else
+            Prefix += "p";
+        } else {
+          if (T->isSignedIntegerType() && T->isCharType())
+            Prefix += "c";
+        }
+        if (T->isBooleanType())
+          Prefix += "b";
+        else if (T->isSignedIntegerType())
+          Prefix += "n";
+        else if (T->isUnsignedIntegerType()) {
+          if (T->isCharType())
+            Prefix += "y";
+          else
+            Prefix += "u";
+        } else if (T->isObjectType()) {
+          StringRef S = Q.getAsString();
+          if (S.endswith_lower("string") || S.endswith_lower("stringw"))
+            Prefix += "str";
+          else if (S.endswith_lower("ptr"))
+            Prefix += "p";
+          else if (S.endswith_lower("array"))
+            Prefix += "ay";
+        }
+        Fixup = Prefix + Fixup;
+      }
+    }
+    break;
   }
 
   return Fixup;
 }
 
+static std::string fixupWithCase(StringRef Name,
+                                 IdentifierNamingCheck::CaseType Case) {
+  return fixupWithCase(Name, nullptr, Case);
+}
+
 static std::string
 fixupWithStyle(StringRef Name,
+               const NamedDecl *Decl,
                const IdentifierNamingCheck::NamingStyle &Style) {
+  if (Name.startswith(Style.Prefix))
+      Name = Name.drop_front(Style.Prefix.size());
+  if (Name.endswith(Style.Suffix))
+      Name = Name.drop_back(Style.Suffix.size());
   const std::string Fixed = fixupWithCase(
-      Name, Style.Case.getValueOr(IdentifierNamingCheck::CaseType::CT_AnyCase));
+    Name, Decl, Style.Case.getValueOr(IdentifierNamingCheck::CaseType::CT_AnyCase));
   StringRef Mid = StringRef(Fixed).trim("_");
   if (Mid.empty())
     Mid = "_";
   return (Style.Prefix + Mid + Style.Suffix).str();
+}
+
+static std::string
+fixupWithStyle(StringRef Name,
+               const IdentifierNamingCheck::NamingStyle &Style) {
+  return fixupWithStyle(Name, nullptr, Style);
 }
 
 static StyleKind findStyleKind(
@@ -839,13 +955,13 @@ void IdentifierNamingCheck::check(const MatchFinder::MatchResult &Result) {
 
     const NamingStyle &Style = *NamingStyles[SK];
     StringRef Name = Decl->getName();
-    if (matchesStyle(Name, Style))
+    if (matchesStyle(Name, Decl, Style))
       return;
 
     std::string KindName = fixupWithCase(StyleNames[SK], CT_LowerCase);
     std::replace(KindName.begin(), KindName.end(), '_', ' ');
 
-    std::string Fixup = fixupWithStyle(Name, Style);
+    std::string Fixup = fixupWithStyle(Name, Decl, Style);
     if (StringRef(Fixup).equals(Name)) {
       if (!IgnoreFailedSplit) {
         LLVM_DEBUG(llvm::dbgs()
